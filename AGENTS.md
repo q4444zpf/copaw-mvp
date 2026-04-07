@@ -1,6 +1,6 @@
 # CoPaw MVP - AGENTS 交接文档
 
-最后更新：2026-04-07
+最后更新：2026-04-08
 
 ## 1. 项目目标
 
@@ -28,6 +28,7 @@
 
 ```text
 copaw-mvp/
+  .gitignore
   server/
     src/index.js         # API 路由、会话管理、SSE 转发
     src/copawClient.js   # 调用 CoPaw，解析响应
@@ -193,3 +194,19 @@ cd copaw-mvp/web-demo && npm run build
 - 在中间层引入业务系统 JWT 校验并自动解析租户/用户
 - 增加会话标题生成与分页加载历史
 - 将镜像维护改为 npm 包或 mono-repo 单源组件，减少双份修改风险
+
+## 13. 仓库协作约定（GitHub）
+
+- 远程仓库：`https://github.com/q4444zpf/copaw-mvp.git`
+- 默认分支：`main`
+- 提交前执行：
+  - `cd server && npm run check`
+  - `cd ../web-demo && npm run build`
+- 根目录已配置 `.gitignore`，默认不提交以下内容：
+  - `node_modules/`
+  - `.env`（仅保留 `.env.example`）
+  - `output/`、`.playwright-cli/`、`*.log`
+- 推荐提交流程：
+  - `git add .`
+  - `git commit -m "<type>: <summary>"`
+  - `git push origin main`
