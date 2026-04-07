@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Environment files
+.env
+**/.env
+!.env.example
+!**/.env.example
+
+# Runtime artifacts
+output/
+.playwright-cli/
+*.log
+
+# Build output
+dist/
+build/
+
+# OS/editor
+.DS_Store
+Thumbs.db
