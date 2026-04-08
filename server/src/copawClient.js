@@ -144,6 +144,8 @@ function buildPayload({ tenantId, userId, channel, sessionId, message, metadata 
   }
 
   return {
+    channel,
+    user_id: `${tenantId}:${userId}`,
     input: [{ role: "user", content: [{ type: "text", text: message }] }],
     session_id: sessionId,
   };
@@ -175,6 +177,345 @@ function wrapAbortAsTimeout(error, timeoutMs) {
   );
 }
 
+function parseJsonSafe(rawText) {
+  if (typeof rawText !== "string") return null;
+  const text = rawText.trim();
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function ensureAbsUrl(rawUrl) {
+  const text = String(rawUrl || "").trim();
+  if (!text) return "";
+  try {
+    const url = new URL(text);
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return "";
+  }
+}
+
+function deriveCopawApiBaseUrl() {
+  const explicit = ensureAbsUrl(process.env.COPAW_API_BASE_URL);
+  if (explicit) {
+    return explicit.replace(/\/+$/, "");
+  }
+
+  const messageUrl = ensureAbsUrl(process.env.COPAW_MESSAGE_URL);
+  if (!messageUrl) return "";
+
+  try {
+    const url = new URL(messageUrl);
+    const path = url.pathname.replace(/\/+$/, "");
+
+    const knownSuffixes = [
+      "/agent/process",
+      "/console/chat/stop",
+      "/console/chat",
+      "/channel/webhook",
+    ];
+    for (const suffix of knownSuffixes) {
+      if (path.endsWith(suffix)) {
+        const basePath = path.slice(0, path.length - suffix.length) || "/";
+        url.pathname = basePath;
+        return url.toString().replace(/\/+$/, "");
+      }
+    }
+
+    if (path === "/api" || path.endsWith("/api")) {
+      return url.toString().replace(/\/+$/, "");
+    }
+
+    const apiIdx = path.indexOf("/api/");
+    if (apiIdx >= 0) {
+      url.pathname = path.slice(0, apiIdx + 4);
+      return url.toString().replace(/\/+$/, "");
+    }
+
+    url.pathname = "/";
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return "";
+  }
+}
+
+function resolveChatsUrl() {
+  const explicit = ensureAbsUrl(process.env.COPAW_CHATS_URL);
+  if (explicit) return explicit;
+
+  const base = deriveCopawApiBaseUrl();
+  if (!base) return "";
+  return `${base.replace(/\/+$/, "")}/chats`;
+}
+
+function resolveStopUrl() {
+  const explicit = ensureAbsUrl(process.env.COPAW_STOP_URL);
+  if (explicit) return explicit;
+
+  const base = deriveCopawApiBaseUrl();
+  if (!base) return "";
+  return `${base.replace(/\/+$/, "")}/console/chat/stop`;
+}
+
+function normalizeList(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (payload && typeof payload === "object") {
+    if (Array.isArray(payload.items)) return payload.items;
+    if (Array.isArray(payload.data)) return payload.data;
+    if (Array.isArray(payload.result)) return payload.result;
+  }
+  return [];
+}
+
+function composeCopawUserId(tenantId, userId) {
+  const t = String(tenantId || "").trim();
+  const u = String(userId || "").trim();
+  if (t && u) return `${t}:${u}`;
+  return t || u;
+}
+
+function toTimestamp(value) {
+  const text = String(value || "").trim();
+  if (!text) return 0;
+  const ts = Date.parse(text);
+  return Number.isFinite(ts) ? ts : 0;
+}
+
+function pickLatestChatBySession(chats, sessionId) {
+  const target = String(sessionId || "").trim();
+  if (!target) return null;
+  const matches = chats.filter((chat) => String(chat?.session_id || "").trim() === target);
+  if (!matches.length) return null;
+  const runningMatches = matches.filter(
+    (chat) => String(chat?.status || "").trim().toLowerCase() === "running"
+  );
+  const candidates = runningMatches.length ? runningMatches : matches;
+  candidates.sort((a, b) => {
+    const aTs = Math.max(toTimestamp(a?.updated_at), toTimestamp(a?.created_at));
+    const bTs = Math.max(toTimestamp(b?.updated_at), toTimestamp(b?.created_at));
+    if (aTs !== bTs) return bTs - aTs;
+    return 0;
+  });
+  return candidates[0] || null;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+async function fetchTextWithTimeout({
+  url,
+  options = {},
+  timeoutMs,
+  signal = null,
+  timeoutHint = "请求",
+}) {
+  const ctrl = new AbortController();
+  let abortedByTimeout = false;
+  let abortedByExternal = false;
+  const timeout = setTimeout(() => {
+    abortedByTimeout = true;
+    ctrl.abort();
+  }, timeoutMs);
+  const onExternalAbort = () => {
+    abortedByExternal = true;
+    ctrl.abort();
+  };
+  if (signal) {
+    if (signal.aborted) {
+      onExternalAbort();
+    } else {
+      signal.addEventListener("abort", onExternalAbort, { once: true });
+    }
+  }
+
+  try {
+    const res = await fetch(url, {
+      ...options,
+      signal: ctrl.signal,
+    });
+    const rawText = await res.text();
+    return { res, rawText };
+  } catch (error) {
+    if (isAbortError(error)) {
+      if (abortedByExternal && !abortedByTimeout) {
+        throw new Error("request aborted by caller");
+      }
+      throw new Error(
+        `请求超时：${timeoutHint}在 ${timeoutMs}ms 内未完成，已中止。请增大 COPAW_STOP_TIMEOUT_MS。`
+      );
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+    if (signal) {
+      signal.removeEventListener("abort", onExternalAbort);
+    }
+  }
+}
+
+async function listChatsByFilters({
+  tenantId,
+  userId,
+  channel,
+  agentId = "",
+  signal = null,
+  useFilters = true,
+}) {
+  const chatsUrl = resolveChatsUrl();
+  if (!chatsUrl) {
+    throw new Error("COPAW_CHATS_URL is not configured and cannot be derived");
+  }
+
+  const url = new URL(chatsUrl);
+  if (useFilters) {
+    const copawUserId = composeCopawUserId(tenantId, userId);
+    if (copawUserId) {
+      url.searchParams.set("user_id", copawUserId);
+    }
+    if (channel) {
+      url.searchParams.set("channel", String(channel));
+    }
+  }
+
+  const timeoutMs = Number(process.env.COPAW_STOP_TIMEOUT_MS || process.env.COPAW_TIMEOUT_MS || 30000);
+  const { res, rawText } = await fetchTextWithTimeout({
+    url: url.toString(),
+    options: {
+      method: "GET",
+      headers: buildHeaders(agentId),
+    },
+    timeoutMs,
+    signal,
+    timeoutHint: "查询 CoPaw 会话",
+  });
+
+  if (!res.ok) {
+    throw new Error(`CoPaw list chats failed: ${res.status} ${rawText.slice(0, 500)}`);
+  }
+
+  return normalizeList(parseJsonSafe(rawText) ?? rawText);
+}
+
+async function resolveChatIdBySession({
+  tenantId,
+  userId,
+  channel,
+  sessionId,
+  agentId = "",
+  signal = null,
+}) {
+  const primary = await listChatsByFilters({
+    tenantId,
+    userId,
+    channel,
+    sessionId,
+    agentId,
+    signal,
+    useFilters: true,
+  });
+  let matched = pickLatestChatBySession(primary, sessionId);
+  if (matched) {
+    return String(matched.id || "");
+  }
+
+  const fallback = await listChatsByFilters({
+    tenantId,
+    userId,
+    channel,
+    sessionId,
+    agentId,
+    signal,
+    useFilters: false,
+  });
+  matched = pickLatestChatBySession(fallback, sessionId);
+  if (matched) {
+    return String(matched.id || "");
+  }
+
+  return "";
+}
+
+export async function stopCopawTask({
+  tenantId,
+  userId,
+  channel,
+  sessionId,
+  agentId = "",
+  signal = null,
+}) {
+  const sid = String(sessionId || "").trim();
+  if (!sid) {
+    throw new Error("sessionId is required");
+  }
+
+  const retries = Math.max(1, Number(process.env.COPAW_STOP_LOOKUP_RETRIES || 3));
+  const retryDelayMs = Math.max(50, Number(process.env.COPAW_STOP_LOOKUP_RETRY_DELAY_MS || 250));
+  let chatId = "";
+
+  for (let i = 0; i < retries; i += 1) {
+    // eslint-disable-next-line no-await-in-loop
+    chatId = await resolveChatIdBySession({
+      tenantId,
+      userId,
+      channel,
+      sessionId: sid,
+      agentId,
+      signal,
+    });
+    if (chatId) break;
+    if (i < retries - 1) {
+      // eslint-disable-next-line no-await-in-loop
+      await sleep(retryDelayMs);
+    }
+  }
+
+  if (!chatId) {
+    return { stopped: false, chatId: "", reason: "chat_not_found" };
+  }
+
+  const stopUrlText = resolveStopUrl();
+  if (!stopUrlText) {
+    throw new Error("COPAW_STOP_URL is not configured and cannot be derived");
+  }
+
+  const stopUrl = new URL(stopUrlText);
+  const stopParam = String(process.env.COPAW_STOP_CHAT_ID_PARAM || "chat_id").trim() || "chat_id";
+  stopUrl.searchParams.set(stopParam, chatId);
+
+  const timeoutMs = Number(process.env.COPAW_STOP_TIMEOUT_MS || process.env.COPAW_TIMEOUT_MS || 30000);
+  const { res, rawText } = await fetchTextWithTimeout({
+    url: stopUrl.toString(),
+    options: {
+      method: "POST",
+      headers: buildHeaders(agentId),
+    },
+    timeoutMs,
+    signal,
+    timeoutHint: "终止 CoPaw 任务",
+  });
+
+  if (!res.ok) {
+    throw new Error(`CoPaw stop chat failed: ${res.status} ${rawText.slice(0, 500)}`);
+  }
+
+  const json = parseJsonSafe(rawText);
+  const stopped = typeof json?.stopped === "boolean" ? json.stopped : true;
+  return {
+    stopped,
+    chatId,
+    raw: json ?? rawText,
+  };
+}
+
 export async function sendToCopaw({
   tenantId,
   userId,
@@ -183,6 +524,7 @@ export async function sendToCopaw({
   message,
   agentId = "",
   metadata = {},
+  signal = null,
 }) {
   const url = process.env.COPAW_MESSAGE_URL;
   if (!url) {
@@ -200,7 +542,23 @@ export async function sendToCopaw({
 
   const timeoutMs = Number(process.env.COPAW_TIMEOUT_MS || 30000);
   const ctrl = new AbortController();
-  const timeout = setTimeout(() => ctrl.abort(), timeoutMs);
+  let abortedByTimeout = false;
+  let abortedByExternal = false;
+  const timeout = setTimeout(() => {
+    abortedByTimeout = true;
+    ctrl.abort();
+  }, timeoutMs);
+  const onExternalAbort = () => {
+    abortedByExternal = true;
+    ctrl.abort();
+  };
+  if (signal) {
+    if (signal.aborted) {
+      onExternalAbort();
+    } else {
+      signal.addEventListener("abort", onExternalAbort, { once: true });
+    }
+  }
 
   try {
     const res = await fetch(url, {
@@ -227,9 +585,18 @@ export async function sendToCopaw({
       text: parseCopawResponse(json ?? rawText),
     };
   } catch (error) {
-    throw wrapAbortAsTimeout(error, timeoutMs);
+    if (isAbortError(error)) {
+      if (abortedByExternal && !abortedByTimeout) {
+        throw new Error("request aborted by caller");
+      }
+      throw wrapAbortAsTimeout(error, timeoutMs);
+    }
+    throw error;
   } finally {
     clearTimeout(timeout);
+    if (signal) {
+      signal.removeEventListener("abort", onExternalAbort);
+    }
   }
 }
 
@@ -241,6 +608,7 @@ export async function streamToCopaw({
   message,
   agentId = "",
   metadata = {},
+  signal = null,
   onEvent = () => {},
 }) {
   const url = process.env.COPAW_MESSAGE_URL;
@@ -259,7 +627,23 @@ export async function streamToCopaw({
 
   const timeoutMs = Number(process.env.COPAW_TIMEOUT_MS || 30000);
   const ctrl = new AbortController();
-  const timeout = setTimeout(() => ctrl.abort(), timeoutMs);
+  let abortedByTimeout = false;
+  let abortedByExternal = false;
+  const timeout = setTimeout(() => {
+    abortedByTimeout = true;
+    ctrl.abort();
+  }, timeoutMs);
+  const onExternalAbort = () => {
+    abortedByExternal = true;
+    ctrl.abort();
+  };
+  if (signal) {
+    if (signal.aborted) {
+      onExternalAbort();
+    } else {
+      signal.addEventListener("abort", onExternalAbort, { once: true });
+    }
+  }
 
   try {
     const res = await fetch(url, {
@@ -317,8 +701,17 @@ export async function streamToCopaw({
       text: parseCopawResponse(rawText),
     };
   } catch (error) {
-    throw wrapAbortAsTimeout(error, timeoutMs);
+    if (isAbortError(error)) {
+      if (abortedByExternal && !abortedByTimeout) {
+        throw new Error("request aborted by caller");
+      }
+      throw wrapAbortAsTimeout(error, timeoutMs);
+    }
+    throw error;
   } finally {
     clearTimeout(timeout);
+    if (signal) {
+      signal.removeEventListener("abort", onExternalAbort);
+    }
   }
 }

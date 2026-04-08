@@ -128,13 +128,65 @@
     </div>
 
     <form class="copaw-input" @submit.prevent="onSubmit">
-      <input
+      <textarea
         v-model="inputText"
-        :disabled="loading || sessionSwitching"
+        class="copaw-textarea"
+        :disabled="sessionSwitching"
+        :maxlength="inputMaxLength"
         placeholder="输入 / 查看快捷指令；审批时可使用 /approve 或 /deny ..."
-        autocomplete="off"
-      />
-      <button type="submit" :disabled="loading || sessionSwitching || !inputText.trim()">发送</button>
+        rows="3"
+        @keydown="onInputKeydown"
+        @compositionstart="onInputCompositionStart"
+        @compositionend="onInputCompositionEnd"
+      ></textarea>
+
+      <div class="copaw-input-footer">
+        <div class="input-tools">
+          <button type="button" class="tool-icon-btn" :disabled="loading || sessionSwitching">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path
+                d="M12 4.5a2.5 2.5 0 0 1 2.5 2.5v5a2.5 2.5 0 0 1-5 0V7A2.5 2.5 0 0 1 12 4.5zM7.5 11.5a.75.75 0 0 1 .75.75 3.75 3.75 0 0 0 7.5 0 .75.75 0 0 1 1.5 0 5.25 5.25 0 0 1-4.5 5.2v1.3h2a.75.75 0 0 1 0 1.5h-5.5a.75.75 0 0 1 0-1.5h2v-1.3a5.25 5.25 0 0 1-4.5-5.2.75.75 0 0 1 .75-.75z"
+              />
+            </svg>
+          </button>
+          <button type="button" class="tool-icon-btn" :disabled="loading || sessionSwitching">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path
+                d="M8.5 12.5v5a3.5 3.5 0 0 0 7 0V9a2 2 0 0 0-4 0v7.5a.5.5 0 0 0 1 0V10a.75.75 0 0 1 1.5 0v6.5a2 2 0 0 1-4 0V9a3.5 3.5 0 0 1 7 0v8.5a5 5 0 0 1-10 0v-5a.75.75 0 0 1 1.5 0z"
+              />
+            </svg>
+          </button>
+        </div>
+
+        <div class="input-actions">
+          <span class="input-counter">{{ inputText.length }}/{{ inputMaxLength }}</span>
+
+          <button
+            v-if="!loading"
+            type="submit"
+            class="send-btn"
+            :disabled="sessionSwitching || !inputText.trim()"
+            aria-label="发送"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 4.75a.75.75 0 0 1 .75.75v10.19l3.22-3.22a.75.75 0 1 1 1.06 1.06l-4.5 4.5a.75.75 0 0 1-1.06 0l-4.5-4.5a.75.75 0 1 1 1.06-1.06l3.22 3.22V5.5a.75.75 0 0 1 .75-.75z" />
+            </svg>
+          </button>
+
+          <button
+            v-else
+            type="button"
+            class="send-btn stop-btn"
+            :disabled="sessionSwitching"
+            aria-label="停止"
+            @click="onStopGeneration"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M8 8h8v8H8z" />
+            </svg>
+          </button>
+        </div>
+      </div>
     </form>
   </section>
 </template>
@@ -152,6 +204,7 @@ import {
   resetSession,
   selectSession,
   sendMessageStream,
+  stopChatTask,
 } from "../services/copawApi.js";
 
 const props = defineProps({
@@ -160,10 +213,24 @@ const props = defineProps({
   userId: { type: String, required: true },
   channel: { type: String, default: "web-chat" },
   title: { type: String, default: "CoPaw 助手" },
+  skillMethods: { type: Object, default: () => ({}) },
+  skillToolNames: {
+    type: Array,
+    default: () => [
+      "vue3_page_control_dispatch",
+      "copaw_web_skill_dispatch",
+      "invoke_vue_method",
+    ],
+  },
+  skillNamespace: { type: String, default: "vue3-page-control" },
+  allowAssistantSkillCommand: { type: Boolean, default: false },
 });
+const emit = defineEmits(["skill-invoke", "skill-success", "skill-error"]);
 
 const bodyRef = ref(null);
 const inputText = ref("");
+const inputMaxLength = 10000;
+const isInputComposing = ref(false);
 const loading = ref(false);
 const sessionSwitching = ref(false);
 const sessionId = ref("");
@@ -179,10 +246,17 @@ const agentsLoading = ref(false);
 const agentOptions = ref([]);
 const selectedAgentId = ref("");
 const selectedTraceId = ref("");
+const streamAbortController = ref(null);
+const stopRequested = ref(false);
+const stopRequestInFlight = ref(false);
+const activeStreamAgentId = ref("");
+const executedSkillCommandIds = new Set();
 const fileRefPattern =
   /(?:^|[\s("'`（【\[])([A-Za-z0-9_./\\-]+\.(?:png|jpg|jpeg|gif|webp|svg|html?|pdf|csv|txt|json|md))/gim;
 const imageFileExtensions = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg"]);
 const htmlFileExtensions = new Set(["html", "htm"]);
+const skillFencePattern = /```(?:copaw-web-skill|copaw-skill|copaw_skill)\s*([\s\S]*?)```/gim;
+const skillTagPattern = /<copaw-web-skill>([\s\S]*?)<\/copaw-web-skill>/gim;
 
 function getModelStorageKey() {
   return `copaw:model:${props.tenantId}:${props.userId}:${props.channel}`;
@@ -290,6 +364,210 @@ function safeJson(value) {
     return JSON.stringify(value, null, 2);
   } catch {
     return String(value);
+  }
+}
+
+function tryParseJson(value) {
+  if (typeof value !== "string") return value;
+  const text = value.trim();
+  if (!text) return value;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return value;
+  }
+}
+
+function normalizeSkillToolNames() {
+  const source = Array.isArray(props.skillToolNames) ? props.skillToolNames : [];
+  return new Set(
+    source
+      .map((item) => String(item || "").trim().toLowerCase())
+      .filter(Boolean)
+  );
+}
+
+function isSkillToolName(toolName) {
+  const normalized = String(toolName || "").trim().toLowerCase();
+  if (!normalized) return false;
+  return normalizeSkillToolNames().has(normalized);
+}
+
+function stableJson(value) {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value ?? null);
+  } catch {
+    return String(value ?? "");
+  }
+}
+
+function normalizeSkillCommand(payload, extra = {}) {
+  const raw = typeof payload === "string" ? tryParseJson(payload) : payload;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+
+  const method = String(raw.method || raw.methodName || raw.method_name || "").trim();
+  if (!method) return null;
+
+  const action = String(raw.action || "invoke_method")
+    .trim()
+    .toLowerCase();
+  if (
+    action &&
+    action !== "invoke_method" &&
+    action !== "invoke" &&
+    action !== "call_method"
+  ) {
+    return null;
+  }
+
+  const payloadNamespace = String(
+    raw.skill || raw.skillName || raw.skill_name || raw.namespace || raw.copaw_skill || ""
+  ).trim();
+  const expectedNamespace = String(props.skillNamespace || "").trim();
+  if (payloadNamespace && expectedNamespace && payloadNamespace !== expectedNamespace) {
+    return null;
+  }
+
+  const args = raw.args ?? raw.payload ?? {};
+  const explicitId = String(raw.commandId || raw.command_id || raw.id || "").trim();
+  const fallbackId = `${String(extra.callId || "").trim()}:${method}:${stableJson(args)}`;
+  const toolSource = String(
+    extra.toolSource || (extra.synthetic === true ? "synthetic" : "native")
+  ).trim();
+
+  return {
+    commandId: explicitId || fallbackId,
+    skill: payloadNamespace || expectedNamespace || "web-skill",
+    method,
+    args,
+    source: String(extra.source || "unknown"),
+    callId: String(extra.callId || ""),
+    toolName: String(extra.toolName || ""),
+    toolSource: toolSource || "native",
+  };
+}
+
+function extractSkillCommandsFromText(text, extra = {}) {
+  const source = String(text || "");
+  if (!source.trim()) return [];
+
+  const commands = [];
+  const tryPush = (payloadText) => {
+    const command = normalizeSkillCommand(payloadText, extra);
+    if (command) {
+      commands.push(command);
+    }
+  };
+
+  skillFencePattern.lastIndex = 0;
+  let matched;
+  while ((matched = skillFencePattern.exec(source)) !== null) {
+    tryPush(String(matched[1] || "").trim());
+  }
+
+  skillTagPattern.lastIndex = 0;
+  while ((matched = skillTagPattern.exec(source)) !== null) {
+    tryPush(String(matched[1] || "").trim());
+  }
+
+  if (!commands.length) {
+    tryPush(source.trim());
+  }
+
+  return commands;
+}
+
+function getSkillMethod(methodName) {
+  const localMethods =
+    props.skillMethods && typeof props.skillMethods === "object" ? props.skillMethods : {};
+  if (typeof localMethods[methodName] === "function") {
+    return localMethods[methodName];
+  }
+
+  return null;
+}
+
+function looksLikeSkillDispatchText(text) {
+  const source = String(text || "");
+  if (!source.trim()) return false;
+  return /vue3_page_control_dispatch|invoke_method|commandid|已发送.*命令|命令格式如下|页面控制命令/iu.test(
+    source
+  );
+}
+
+function fireSkillEvent(eventName, detail) {
+  emit(eventName, detail);
+  if (typeof window === "undefined" || typeof window.dispatchEvent !== "function") {
+    return;
+  }
+  window.dispatchEvent(
+    new CustomEvent(`copaw:${eventName}`, {
+      detail,
+    })
+  );
+}
+
+async function executeSkillCommand(command) {
+  const key = String(command?.commandId || "").trim();
+  if (key && executedSkillCommandIds.has(key)) return;
+  if (key) {
+    executedSkillCommandIds.add(key);
+  }
+
+  const methodName = String(command?.method || "").trim();
+  const handler = getSkillMethod(methodName);
+  const detail = {
+    ...command,
+    context: {
+      apiBaseUrl: props.apiBaseUrl,
+      tenantId: props.tenantId,
+      userId: props.userId,
+      channel: props.channel,
+      sessionId: sessionId.value,
+      timestamp: new Date().toISOString(),
+    },
+  };
+
+  fireSkillEvent("skill-invoke", detail);
+
+  if (typeof handler !== "function") {
+    fireSkillEvent("skill-error", {
+      ...detail,
+      error: `未找到可执行的方法: ${methodName}`,
+    });
+    return;
+  }
+
+  try {
+    const result = await Promise.resolve(handler(command.args || {}, detail.context));
+    fireSkillEvent("skill-success", {
+      ...detail,
+      result,
+    });
+  } catch (error) {
+    fireSkillEvent("skill-error", {
+      ...detail,
+      error: error instanceof Error ? error.message : String(error || "unknown error"),
+    });
+  }
+}
+
+async function executeSkillCommandsFromPayload(payload, extra = {}) {
+  if (payload == null) return;
+
+  if (typeof payload === "string") {
+    const commands = extractSkillCommandsFromText(payload, extra);
+    for (const command of commands) {
+      // eslint-disable-next-line no-await-in-loop
+      await executeSkillCommand(command);
+    }
+    return;
+  }
+
+  const command = normalizeSkillCommand(payload, extra);
+  if (command) {
+    await executeSkillCommand(command);
   }
 }
 
@@ -537,6 +815,60 @@ async function copyText(text) {
   }
 }
 
+function isAbortError(error) {
+  if (!error || typeof error !== "object") return false;
+  const name = String(error.name || "");
+  const message = String(error.message || "");
+  return name === "AbortError" || message.toLowerCase().includes("aborted");
+}
+
+function onInputCompositionStart() {
+  isInputComposing.value = true;
+}
+
+function onInputCompositionEnd() {
+  window.setTimeout(() => {
+    isInputComposing.value = false;
+  }, 0);
+}
+
+function onInputKeydown(event) {
+  if (!event || event.key !== "Enter") return;
+  if (event.shiftKey || isInputComposing.value) return;
+  event.preventDefault();
+  if (loading.value) return;
+  void onSubmit();
+}
+
+async function onStopGeneration() {
+  if (!loading.value || !streamAbortController.value || stopRequestInFlight.value) return;
+  stopRequested.value = true;
+  stopRequestInFlight.value = true;
+
+  const abortController = streamAbortController.value;
+  const targetSessionId = String(sessionId.value || "").trim();
+  const targetAgentId = normalizeAgentValue(activeStreamAgentId.value || selectedAgentId.value);
+  const stopPromise = targetSessionId
+    ? stopChatTask({
+        apiBaseUrl: props.apiBaseUrl,
+        tenantId: props.tenantId,
+        userId: props.userId,
+        channel: props.channel,
+        sessionId: targetSessionId,
+        agentId: targetAgentId,
+        modelId: selectedModelId.value,
+      }).catch((error) => {
+        // Keep UX responsive; local abort still closes the stream on failure.
+        // eslint-disable-next-line no-console
+        console.error("Failed to stop CoPaw task:", error);
+      })
+    : Promise.resolve();
+
+  abortController.abort();
+  await stopPromise;
+  stopRequestInFlight.value = false;
+}
+
 async function onBodyClick(event) {
   const target = event?.target;
   if (!(target instanceof HTMLElement)) return;
@@ -724,14 +1056,21 @@ async function runChat(text) {
   append("user", text);
   loading.value = true;
   streamingStarted.value = false;
+  stopRequested.value = false;
+  const abortController = new AbortController();
+  streamAbortController.value = abortController;
   await scrollToBottom();
 
   try {
     let reasoningId = "";
     let assistantId = "";
+    let sawSkillToolEvent = false;
+    let diagnosticEmitted = false;
     const toolByMsgId = new Map();
     const toolByCallId = new Map();
     const effectiveAgentId = normalizeAgentValue(selectedAgentId.value);
+    activeStreamAgentId.value = effectiveAgentId;
+    executedSkillCommandIds.clear();
 
     await sendMessageStream({
       apiBaseUrl: props.apiBaseUrl,
@@ -742,6 +1081,7 @@ async function runChat(text) {
       agentId: effectiveAgentId,
       modelId: selectedModelId.value,
       message: text,
+      signal: abortController.signal,
       metadata: {
         source: "embedded-vue-widget",
         model_id: selectedModelId.value || "",
@@ -768,6 +1108,7 @@ async function runChat(text) {
         if (ev.type === "tool_start") {
           const msgId = String(ev.msgId || "");
           const callId = String(ev.callId || "");
+          const toolName = String(ev.toolName || ev.toolType || "tool_call");
           let toolItemId = "";
 
           if (callId && toolByCallId.has(callId)) {
@@ -775,11 +1116,11 @@ async function runChat(text) {
           } else if (msgId && toolByMsgId.has(msgId)) {
             toolItemId = toolByMsgId.get(msgId);
           } else {
-            toolItemId = appendTool(ev.toolName || ev.toolType || "tool_call", ev.input || null);
+            toolItemId = appendTool(toolName, ev.input || null);
           }
 
           updateToolMeta(toolItemId, {
-            toolName: ev.toolName || ev.toolType || "tool_call",
+            toolName,
             toolInput: ev.input ?? null,
           });
 
@@ -791,6 +1132,16 @@ async function runChat(text) {
           }
           streamingStarted.value = true;
           void scrollToBottom();
+          if (isSkillToolName(toolName)) {
+            sawSkillToolEvent = true;
+            void executeSkillCommandsFromPayload(ev.input, {
+              source: "tool_start",
+              toolName,
+              callId,
+              synthetic: Boolean(ev.synthetic),
+              toolSource: ev.synthetic ? "synthetic" : "native",
+            });
+          }
           return;
         }
 
@@ -820,10 +1171,11 @@ async function runChat(text) {
         if (ev.type === "tool_output") {
           const msgId = String(ev.msgId || "");
           const callId = String(ev.callId || "");
+          const toolName = String(ev.toolName || ev.toolType || "tool_call");
           let toolItemId =
             (callId && toolByCallId.get(callId)) || (msgId && toolByMsgId.get(msgId)) || "";
           if (!toolItemId) {
-            toolItemId = appendTool(ev.toolName || ev.toolType || "tool_call", null);
+            toolItemId = appendTool(toolName, null);
           }
           if (msgId) {
             toolByMsgId.set(msgId, toolItemId);
@@ -832,11 +1184,22 @@ async function runChat(text) {
             toolByCallId.set(callId, toolItemId);
           }
           updateToolMeta(toolItemId, {
-            toolName: ev.toolName || ev.toolType || "tool_call",
+            toolName,
+            toolSource: ev.synthetic ? "synthetic" : "native",
           });
           setMessageText(toolItemId, String(ev.text || "").trim());
           streamingStarted.value = true;
           void scrollToBottom();
+          if (isSkillToolName(toolName)) {
+            sawSkillToolEvent = true;
+            void executeSkillCommandsFromPayload(ev.text, {
+              source: "tool_output",
+              toolName,
+              callId,
+              synthetic: Boolean(ev.synthetic),
+              toolSource: ev.synthetic ? "synthetic" : "native",
+            });
+          }
           return;
         }
 
@@ -859,6 +1222,34 @@ async function runChat(text) {
             setMessageText(assistantId, finalText);
           }
           void scrollToBottom();
+          if (props.allowAssistantSkillCommand) {
+            void executeSkillCommandsFromPayload(finalText, {
+              source: "assistant_final",
+            });
+          }
+          return;
+        }
+
+        if (ev.type === "done") {
+          if (props.allowAssistantSkillCommand && assistantId) {
+            const assistantText =
+              messages.value.find((item) => item.id === assistantId)?.text || "";
+            void executeSkillCommandsFromPayload(assistantText, {
+              source: "assistant_done",
+            });
+          }
+          if (!sawSkillToolEvent && assistantId && !diagnosticEmitted) {
+            const assistantText =
+              messages.value.find((item) => item.id === assistantId)?.text || "";
+            if (looksLikeSkillDispatchText(assistantText)) {
+              diagnosticEmitted = true;
+              append(
+                "assistant",
+                "检测到命令描述文本，但未收到工具事件（tool_output），本次未执行页面方法。请检查 CoPaw 工具注册/策略。"
+              );
+              void scrollToBottom();
+            }
+          }
         }
       },
     });
@@ -867,8 +1258,16 @@ async function runChat(text) {
       await refreshChatSessions();
     }
   } catch (error) {
-    append("assistant", `请求失败：${error.message}`);
+    if (stopRequested.value || isAbortError(error)) {
+      append("assistant", "已停止本次生成。");
+    } else {
+      append("assistant", `请求失败：${error.message}`);
+    }
   } finally {
+    streamAbortController.value = null;
+    stopRequested.value = false;
+    stopRequestInFlight.value = false;
+    activeStreamAgentId.value = "";
     loading.value = false;
     streamingStarted.value = false;
     await scrollToBottom();
@@ -1394,23 +1793,50 @@ onMounted(async () => {
 }
 
 .copaw-input {
-  height: 64px;
   border-top: 1px solid #eef2f7;
-  display: flex;
-  gap: 8px;
-  padding: 10px;
+  padding: 10px 12px;
   background: #fff;
 }
 
-.copaw-input input {
-  flex: 1;
-  border: 1px solid #cfd8e3;
-  border-radius: 8px;
-  padding: 0 10px;
+.copaw-textarea {
+  width: 100%;
+  min-height: 60px;
+  max-height: 200px;
+  border: 1px solid #d8dde6;
+  border-radius: 10px;
+  padding: 12px 14px 8px;
+  resize: vertical;
   font-size: 14px;
+  line-height: 1.45;
+  color: #1f2937;
+  background: #fff;
 }
 
-.copaw-input button,
+.copaw-textarea::placeholder {
+  color: #b0b6bf;
+}
+
+.copaw-textarea:focus {
+  outline: none;
+  border-color: #c5ccd8;
+  box-shadow: 0 0 0 2px rgba(15, 98, 254, 0.08);
+}
+
+.copaw-input-footer {
+  border-top: 1px solid #eef2f7;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: -1px;
+  padding: 8px 10px 0;
+}
+
+.input-tools {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
 .ghost {
   border: 1px solid #c8d3e0;
   background: #fff;
@@ -1419,13 +1845,80 @@ onMounted(async () => {
   cursor: pointer;
 }
 
-.copaw-input button {
-  background: #0f62fe;
-  border-color: #0f62fe;
-  color: #fff;
+.tool-icon-btn {
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: transparent;
+  border-radius: 8px;
+  color: #2f3b4a;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+.tool-icon-btn:hover {
+  background: #f2f4f7;
+}
+
+.tool-icon-btn svg {
+  width: 17px;
+  height: 17px;
+  fill: currentColor;
+}
+
+.input-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.input-counter {
+  color: #9ca3af;
+  font-size: 13px;
+  min-width: 74px;
+  text-align: right;
+}
+
+.send-btn {
+  width: 30px;
+  height: 30px;
+  border: 1px solid #d0d5dd;
+  background: #f7f8fa;
+  border-radius: 8px;
+  color: #9aa1ad;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+.send-btn svg {
+  width: 16px;
+  height: 16px;
+  fill: currentColor;
+}
+
+.send-btn:not(:disabled) {
+  background: #fff;
+  color: #6c7481;
+}
+
+.send-btn:not(:disabled):hover {
+  border-color: #bcc3ce;
+}
+
+.stop-btn:not(:disabled) {
+  color: #b84a4a;
 }
 
 .copaw-input button:disabled,
+.tool-icon-btn:disabled,
+.send-btn:disabled,
+.copaw-textarea:disabled,
 .ghost:disabled,
 .history-item:disabled,
 .model-switch select:disabled,

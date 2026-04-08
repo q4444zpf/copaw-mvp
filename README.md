@@ -21,6 +21,9 @@
 copaw-mvp/
   server/                  # Node.js 中间层
   client-vue/              # Vue 嵌入式组件示例
+  web-demo/                # 可直接运行的联调页面
+  skills/
+    vue3-page-control/     # Vue3 页面控制 Web 方法调用 skill
 ```
 
 ## 快速启动（后端）
@@ -71,3 +74,15 @@ npm run dev
 ## Vue 组件接入
 
 见 `client-vue/README.md` 与 `client-vue/src/components/CopawChatWidget.vue`。
+
+## Vue3 页面控制 Skill（Vue 方法执行）
+
+已新增 `skills/vue3-page-control/SKILL.md`，用于约束 CoPaw 通过
+`vue3_page_control_dispatch` 工具向前端发送结构化指令。
+
+前端组件 `CopawChatWidget.vue` 已支持：
+
+- 解析 skill 命令（tool input/output、代码围栏、XML 包裹）
+- 白名单工具名校验（`skillToolNames`）
+- 调用宿主传入的方法映射（`skillMethods`）
+- 通过事件回传执行结果（`skill-invoke` / `skill-success` / `skill-error`）

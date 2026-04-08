@@ -158,6 +158,31 @@ export async function sendMessage({
   return data;
 }
 
+export async function stopChatTask({
+  apiBaseUrl,
+  tenantId,
+  userId,
+  channel,
+  sessionId = "",
+  agentId = "",
+  modelId = "",
+}) {
+  const res = await fetch(`${apiBaseUrl}/api/chat/stop`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-tenant-id": tenantId,
+      "x-user-id": userId,
+    },
+    body: JSON.stringify({ channel, sessionId, agentId, modelId }),
+  });
+  const data = await res.json();
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error || "Failed to stop chat task");
+  }
+  return data;
+}
+
 function parseSseFrame(frame) {
   const dataLines = frame
     .split(/\r?\n/)
@@ -197,6 +222,7 @@ export async function sendMessageStream({
   modelId = "",
   message,
   metadata = {},
+  signal,
   onEvent = () => {},
 }) {
   const res = await fetch(`${apiBaseUrl}/api/chat/stream`, {
@@ -207,6 +233,7 @@ export async function sendMessageStream({
       "x-user-id": userId,
       Accept: "text/event-stream",
     },
+    signal,
     body: JSON.stringify({ channel, sessionId, agentId, modelId, message, metadata }),
   });
 

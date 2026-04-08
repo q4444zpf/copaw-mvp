@@ -13,7 +13,7 @@ import {
   listUserChatSessions,
   hasSessionMessages,
 } from "./db.js";
-import { sendToCopaw, streamToCopaw } from "./copawClient.js";
+import { sendToCopaw, stopCopawTask, streamToCopaw } from "./copawClient.js";
 
 const app = express();
 const port = Number(process.env.PORT || 8787);
@@ -175,6 +175,13 @@ function sseWrite(res, payload) {
   res.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
+function isAbortLikeError(error) {
+  if (!error || typeof error !== "object") return false;
+  const name = String(error.name || "");
+  const msg = String(error.message || "").toLowerCase();
+  return name === "AbortError" || msg.includes("aborted");
+}
+
 function tryParseJson(value) {
   if (typeof value !== "string") return value;
   const text = value.trim();
@@ -222,6 +229,128 @@ function normalizeToolOutput(rawOutput) {
   }
 
   return String(parsed || "");
+}
+
+const syntheticSkillToolName = "vue3_page_control_dispatch";
+const skillFencePattern = /```(?:copaw-web-skill)\s*([\s\S]*?)```/gim;
+const skillTagPattern = /<copaw-web-skill>([\s\S]*?)<\/copaw-web-skill>/gim;
+
+function isSkillToolName(toolName) {
+  return String(toolName || "").trim().toLowerCase() === syntheticSkillToolName;
+}
+
+function normalizeSyntheticSkillCommand(rawPayload) {
+  const raw = typeof rawPayload === "string" ? tryParseJson(rawPayload) : rawPayload;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+
+  const skill = String(
+    raw.skill || raw.skillName || raw.skill_name || raw.namespace || raw.copaw_skill || ""
+  ).trim();
+  if (skill !== "vue3-page-control") {
+    return null;
+  }
+
+  const action = String(raw.action || "").trim().toLowerCase();
+  if (action !== "invoke_method") {
+    return null;
+  }
+
+  const method = String(raw.method || raw.methodName || raw.method_name || "").trim();
+  if (!method) {
+    return null;
+  }
+
+  const args = raw.args ?? raw.payload ?? {};
+  if (!args || typeof args !== "object" || Array.isArray(args)) {
+    return null;
+  }
+
+  const commandId = String(raw.commandId || raw.command_id || raw.id || "").trim();
+  return {
+    skill: "vue3-page-control",
+    action: "invoke_method",
+    commandId: commandId || `synthetic-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    method,
+    args,
+  };
+}
+
+function extractFirstJsonObjectText(source) {
+  const text = String(source || "");
+  if (!text) return "";
+
+  for (let start = text.indexOf("{"); start >= 0; start = text.indexOf("{", start + 1)) {
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+
+    for (let i = start; i < text.length; i += 1) {
+      const ch = text[i];
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (ch === "\\") {
+          escaped = true;
+        } else if (ch === "\"") {
+          inString = false;
+        }
+        continue;
+      }
+
+      if (ch === "\"") {
+        inString = true;
+        continue;
+      }
+
+      if (ch === "{") {
+        depth += 1;
+      } else if (ch === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          const candidate = text.slice(start, i + 1).trim();
+          const parsed = tryParseJson(candidate);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            return candidate;
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  return "";
+}
+
+function extractSyntheticSkillCommand(text) {
+  const source = String(text || "");
+  if (!source.trim()) return null;
+
+  const tryPick = (payloadText) => normalizeSyntheticSkillCommand(payloadText);
+
+  skillFencePattern.lastIndex = 0;
+  let matched;
+  while ((matched = skillFencePattern.exec(source)) !== null) {
+    const command = tryPick(String(matched[1] || "").trim());
+    if (command) return command;
+  }
+
+  skillTagPattern.lastIndex = 0;
+  while ((matched = skillTagPattern.exec(source)) !== null) {
+    const command = tryPick(String(matched[1] || "").trim());
+    if (command) return command;
+  }
+
+  const parsedWhole = tryPick(source.trim());
+  if (parsedWhole) {
+    return parsedWhole;
+  }
+
+  const jsonObjectText = extractFirstJsonObjectText(source);
+  if (jsonObjectText) {
+    return tryPick(jsonObjectText);
+  }
+
+  return null;
 }
 
 function isPathInside(baseDir, targetPath) {
@@ -513,6 +642,63 @@ app.post("/api/chat/reset", (req, res) => {
   return res.json({ ok: true, channel, sessionId });
 });
 
+app.post("/api/chat/stop", async (req, res) => {
+  const auth = authContext(req);
+  if (!auth.ok) {
+    return res.status(401).json({ ok: false, error: auth.error });
+  }
+
+  const channel = String(req.body?.channel || "web-chat");
+  const requestedSessionId = normalizeSessionId(req.body?.sessionId);
+  const fallbackSessionId = getSession(auth.tenantId, auth.userId, channel) || "";
+  const candidateSessionId = requestedSessionId || fallbackSessionId;
+  const agentId = normalizeAgentId(req.body);
+
+  if (!candidateSessionId) {
+    return res.status(400).json({ ok: false, error: "sessionId is required" });
+  }
+
+  const selected = resolveSessionForRead({
+    tenantId: auth.tenantId,
+    userId: auth.userId,
+    channel,
+    requestedSessionId: candidateSessionId,
+  });
+  if (!selected.ok) {
+    return res.status(selected.code).json({ ok: false, error: selected.error });
+  }
+
+  try {
+    const result = await stopCopawTask({
+      tenantId: auth.tenantId,
+      userId: auth.userId,
+      channel,
+      sessionId: selected.sessionId,
+      agentId,
+    });
+    if (!result.chatId) {
+      return res.status(404).json({
+        ok: false,
+        sessionId: selected.sessionId,
+        error: "CoPaw chat not found for the current session",
+      });
+    }
+    return res.json({
+      ok: true,
+      channel,
+      sessionId: selected.sessionId,
+      stopped: Boolean(result.stopped),
+      chatId: result.chatId,
+    });
+  } catch (error) {
+    return res.status(502).json({
+      ok: false,
+      sessionId: selected.sessionId,
+      error: error instanceof Error ? error.message : "failed to stop CoPaw task",
+    });
+  }
+});
+
 app.post("/api/chat/message", async (req, res) => {
   const auth = authContext(req);
   if (!auth.ok) {
@@ -610,6 +796,18 @@ app.post("/api/chat/stream", async (req, res) => {
     return res.status(selected.code).json({ ok: false, error: selected.error });
   }
   const sessionId = selected.sessionId;
+  let clientClosed = false;
+  const callerAbortCtrl = new AbortController();
+  const onClientClose = () => {
+    if (clientClosed) return;
+    clientClosed = true;
+    callerAbortCtrl.abort();
+  };
+  // NOTE: `req.close` may fire after request body is consumed, which is too early
+  // for SSE. Track real disconnects via response close and request aborted.
+  res.on("close", onClientClose);
+  req.on("aborted", onClientClose);
+
   saveMessage({
     tenantId: auth.tenantId,
     userId: auth.userId,
@@ -627,11 +825,14 @@ app.post("/api/chat/stream", async (req, res) => {
     res.flushHeaders();
   }
 
-  sseWrite(res, { type: "session", sessionId });
+  if (!clientClosed) {
+    sseWrite(res, { type: "session", sessionId });
+  }
 
   const messageTypes = new Map();
   const messageNames = new Map();
   let sawAssistantDelta = false;
+  let sawSkillToolEvent = false;
   let reasoningText = "";
 
   try {
@@ -643,7 +844,9 @@ app.post("/api/chat/stream", async (req, res) => {
       message,
       agentId,
       metadata,
+      signal: callerAbortCtrl.signal,
       onEvent: (ev) => {
+        if (clientClosed) return;
         if (!ev || typeof ev !== "object") return;
 
         if (ev.object === "message" && ev.id && typeof ev.type === "string") {
@@ -662,30 +865,42 @@ app.post("/api/chat/stream", async (req, res) => {
 
             if (ev.type === "plugin_call") {
               const block = blocks[blocks.length - 1] || {};
+              const emittedToolName = String(block.name || toolName || ev.type);
+              if (isSkillToolName(emittedToolName)) {
+                sawSkillToolEvent = true;
+              }
               sseWrite(res, {
                 type: "tool_start",
                 msgId: ev.id,
                 callId: String(block.call_id || ""),
                 toolType: ev.type,
-                toolName: String(block.name || toolName || ev.type),
+                toolName: emittedToolName,
                 input: tryParseJson(block.arguments || ev.arguments || ev.input || null),
               });
             } else if (ev.type === "plugin_call_output") {
               const block = blocks[blocks.length - 1] || {};
+              const emittedToolName = String(block.name || toolName || ev.type);
+              if (isSkillToolName(emittedToolName)) {
+                sawSkillToolEvent = true;
+              }
               sseWrite(res, {
                 type: "tool_output",
                 msgId: ev.id,
                 callId: String(block.call_id || ""),
                 toolType: ev.type,
-                toolName: String(block.name || toolName || ev.type),
+                toolName: emittedToolName,
                 text: normalizeToolOutput(block.output || ev.output || ""),
               });
             } else if (ev.type !== "plugin_call_output") {
+              const emittedToolName = String(toolName || ev.type);
+              if (isSkillToolName(emittedToolName)) {
+                sawSkillToolEvent = true;
+              }
               sseWrite(res, {
                 type: "tool_start",
                 msgId: ev.id,
                 toolType: ev.type,
-                toolName: String(toolName || ev.type),
+                toolName: emittedToolName,
                 input: ev.input || ev.args || ev.arguments || null,
               });
             }
@@ -723,6 +938,9 @@ app.post("/api/chat/stream", async (req, res) => {
       },
     });
 
+    if (clientClosed) {
+      return;
+    }
     const assistantText = String(copaw.text || "").trim() || "(empty response)";
     if (reasoningText.trim()) {
       saveMessage({
@@ -746,14 +964,36 @@ app.post("/api/chat/stream", async (req, res) => {
     if (!sawAssistantDelta) {
       sseWrite(res, { type: "assistant_final", text: assistantText });
     }
+    if (!sawSkillToolEvent) {
+      const syntheticCommand = extractSyntheticSkillCommand(assistantText);
+      if (syntheticCommand) {
+        const msgId = `synthetic-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        sseWrite(res, {
+          type: "tool_output",
+          msgId,
+          callId: syntheticCommand.commandId,
+          toolType: "synthetic_tool_output",
+          toolName: syntheticSkillToolName,
+          synthetic: true,
+          text: JSON.stringify(syntheticCommand),
+        });
+      }
+    }
     sseWrite(res, { type: "done", sessionId, raw: copaw.raw });
   } catch (error) {
+    if (clientClosed || isAbortLikeError(error)) {
+      return;
+    }
     sseWrite(res, {
       type: "error",
       error: error instanceof Error ? error.message : "unknown error",
     });
   } finally {
-    res.end();
+    res.off("close", onClientClose);
+    req.off("aborted", onClientClose);
+    if (!res.writableEnded) {
+      res.end();
+    }
   }
 });
 
