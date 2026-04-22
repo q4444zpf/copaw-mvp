@@ -61,8 +61,9 @@ npm run dev
 - `GET /health`
 - `POST /api/chat/session`
 - `POST /api/chat/message`
-- `POST /api/chat/stream`（SSE，支持思考过程和回答增量）
+- `POST /api/chat/stream`（SSE，支持思考过程和回答增量，含 `ping` 心跳事件）
 - `POST /api/chat/reset`
+- `POST /api/chat/upload`（multipart 文件上传到工作目录，字段：`file`，可选：`channel`、`sessionId`）
 - `GET /api/files/content?name=<file>` 或 `?path=<relative/path>`（将工作区生成文件映射为 Web URL）
 - `GET /api/admin/sessions`（需配置 `ADMIN_TOKEN` 并携带 `x-admin-token`）
 

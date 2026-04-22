@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import express from "express";
 import cors from "cors";
+import multer from "multer";
 import { v4 as uuidv4 } from "uuid";
 import {
   getSession,
@@ -24,6 +25,9 @@ const workspaceRoot = path.resolve(
 );
 const fileSearchMaxDepth = Math.max(1, Number(process.env.COPAW_FILE_SEARCH_MAX_DEPTH || 8));
 const fileSearchMaxEntries = Math.max(100, Number(process.env.COPAW_FILE_SEARCH_MAX_ENTRIES || 20000));
+const uploadMaxMb = Math.max(1, Number(process.env.COPAW_UPLOAD_MAX_MB || 10));
+const uploadMaxBytes = uploadMaxMb * 1024 * 1024;
+const sseHeartbeatMs = Math.max(5000, Number(process.env.COPAW_SSE_HEARTBEAT_MS || 15000));
 const previewableExtensions = new Set([
   ".png",
   ".jpg",
@@ -39,6 +43,13 @@ const previewableExtensions = new Set([
   ".json",
   ".md",
 ]);
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: uploadMaxBytes,
+    files: 1,
+  },
+});
 
 app.use(cors({ origin: corsOrigin }));
 app.use(express.json({ limit: "1mb" }));
@@ -75,6 +86,39 @@ function normalizeSessionId(value) {
 function normalizeAgentId(body = {}) {
   const v = String(body.agentId || body.modelId || "").trim();
   return v;
+}
+
+function normalizePathSegment(value, fallback = "unknown", maxLen = 64) {
+  const source = String(value || "").trim();
+  const normalized = source.replace(/[^\w.-]/g, "_").slice(0, maxLen);
+  return normalized || fallback;
+}
+
+function normalizeUploadRelativePath(value) {
+  const normalized = String(value || "")
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\/+/, "");
+  if (!normalized || normalized.split("/").includes("..")) return "";
+  return normalized;
+}
+
+function buildUploadDirectory({ tenantId, userId, channel, sessionId }) {
+  const folder = path.join(
+    workspaceRoot,
+    "uploads",
+    normalizePathSegment(tenantId, "tenant"),
+    normalizePathSegment(userId, "user"),
+    normalizePathSegment(channel, "channel"),
+    normalizePathSegment(sessionId, "session", 120)
+  );
+  return folder;
+}
+
+function safeFilename(name) {
+  const base = path.basename(String(name || "file"));
+  const cleaned = base.replace(/[^\w.\-]/g, "_").slice(0, 200);
+  return cleaned || "file";
 }
 
 function formatSessionPreview(text, maxLen = 80) {
@@ -486,6 +530,81 @@ app.get("/api/files/content", (req, res) => {
   return res.sendFile(filePath);
 });
 
+app.post("/api/chat/upload", (req, res) => {
+  const auth = authContext(req);
+  if (!auth.ok) {
+    return res.status(401).json({ ok: false, error: auth.error });
+  }
+
+  upload.single("file")(req, res, (err) => {
+    if (err) {
+      const msg =
+        err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE"
+          ? `file too large (max ${uploadMaxMb} MB)`
+          : err instanceof Error
+            ? err.message
+            : "upload failed";
+      return res.status(400).json({ ok: false, error: msg });
+    }
+
+    const file = req.file;
+    if (!file) {
+      return res.status(400).json({ ok: false, error: "file is required" });
+    }
+
+    const channel = String(req.body?.channel || "web-chat");
+    const requestedSessionId = normalizeSessionId(req.body?.sessionId);
+    const selected = resolveSessionForRead({
+      tenantId: auth.tenantId,
+      userId: auth.userId,
+      channel,
+      requestedSessionId,
+    });
+    if (!selected.ok) {
+      return res.status(selected.code).json({ ok: false, error: selected.error });
+    }
+
+    const uploadDir = buildUploadDirectory({
+      tenantId: auth.tenantId,
+      userId: auth.userId,
+      channel,
+      sessionId: selected.sessionId,
+    });
+    const safeName = safeFilename(file.originalname || "file");
+    const storedName = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${safeName}`;
+    const absPath = path.join(uploadDir, storedName);
+
+    try {
+      fs.mkdirSync(uploadDir, { recursive: true });
+      fs.writeFileSync(absPath, file.buffer);
+    } catch (writeErr) {
+      return res.status(500).json({
+        ok: false,
+        error: writeErr instanceof Error ? writeErr.message : "failed to write uploaded file",
+      });
+    }
+
+    const relativePath = normalizeUploadRelativePath(path.relative(workspaceRoot, absPath));
+    if (!relativePath) {
+      return res.status(500).json({ ok: false, error: "failed to map uploaded file path" });
+    }
+
+    const previewUrl = `/api/files/content?path=${encodeURIComponent(relativePath)}`;
+    return res.json({
+      ok: true,
+      channel,
+      sessionId: selected.sessionId,
+      fileName: safeName,
+      storedName,
+      relativePath,
+      absolutePath: absPath,
+      size: file.size,
+      mimeType: file.mimetype || "application/octet-stream",
+      url: previewUrl,
+    });
+  });
+});
+
 app.get("/api/admin/sessions", (req, res) => {
   const admin = adminAuth(req);
   if (!admin.ok) {
@@ -824,6 +943,10 @@ app.post("/api/chat/stream", async (req, res) => {
   if (typeof res.flushHeaders === "function") {
     res.flushHeaders();
   }
+  const heartbeatTimer = setInterval(() => {
+    if (clientClosed || res.writableEnded) return;
+    sseWrite(res, { type: "ping", ts: Date.now() });
+  }, sseHeartbeatMs);
 
   if (!clientClosed) {
     sseWrite(res, { type: "session", sessionId });
@@ -989,6 +1112,7 @@ app.post("/api/chat/stream", async (req, res) => {
       error: error instanceof Error ? error.message : "unknown error",
     });
   } finally {
+    clearInterval(heartbeatTimer);
     res.off("close", onClientClose);
     req.off("aborted", onClientClose);
     if (!res.writableEnded) {

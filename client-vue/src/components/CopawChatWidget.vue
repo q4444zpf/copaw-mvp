@@ -113,11 +113,31 @@
         </template>
         <template v-else>
           <div :class="['bubble', item.role]">
-            <div
-              v-if="item.role === 'assistant'"
-              class="md-content"
-              v-html="renderMarkdown(item.text)"
-            ></div>
+            <template v-if="item.role === 'assistant'">
+              <div class="md-content" v-html="renderMarkdown(item.text)"></div>
+            </template>
+            <template v-else-if="item.role === 'user'">
+              <div
+                v-if="Array.isArray(item.attachments) && item.attachments.length"
+                class="user-upload-list"
+              >
+                <div
+                  v-for="upload in item.attachments"
+                  :key="upload.relativePath || upload.fileName"
+                  class="user-upload-item"
+                >
+                  <img
+                    v-if="isImageUpload(upload) && upload.url"
+                    class="user-upload-thumb"
+                    :src="upload.url"
+                    :alt="upload.fileName"
+                  />
+                  <span v-else class="user-upload-type">FILE</span>
+                  <span class="user-upload-name">{{ upload.fileName }}</span>
+                </div>
+              </div>
+              <div class="user-text">{{ item.text }}</div>
+            </template>
             <template v-else>{{ item.text }}</template>
           </div>
         </template>
@@ -128,63 +148,132 @@
     </div>
 
     <form class="copaw-input" @submit.prevent="onSubmit">
-      <textarea
-        v-model="inputText"
-        class="copaw-textarea"
-        :disabled="sessionSwitching"
-        :maxlength="inputMaxLength"
-        placeholder="输入 / 查看快捷指令；审批时可使用 /approve 或 /deny ..."
-        rows="3"
-        @keydown="onInputKeydown"
-        @compositionstart="onInputCompositionStart"
-        @compositionend="onInputCompositionEnd"
-      ></textarea>
+      <div class="composer-shell" :class="{ 'has-attachments': pendingUploads.length }">
+        <div v-if="pendingUploads.length" class="composer-attachments">
+          <div class="composer-attachments-head">
+            <strong>附件预览</strong>
+            <button
+              type="button"
+              class="clear-upload-btn"
+              :disabled="loading || sessionSwitching"
+              @click="clearPendingUploads"
+            >
+              清空
+            </button>
+          </div>
+          <div class="composer-attachments-list">
+            <div
+              v-for="item in pendingUploads"
+              :key="item.id"
+              class="composer-attachment-item"
+              :title="item.relativePath || item.fileName"
+            >
+              <img
+                v-if="isImageUpload(item)"
+                class="composer-attachment-thumb"
+                :src="getUploadPreviewSrc(item)"
+                :alt="item.fileName"
+              />
+              <div v-else class="composer-attachment-file">FILE</div>
+              <div class="composer-attachment-meta">
+                <div class="composer-attachment-name">{{ item.fileName }}</div>
+                <div class="composer-attachment-status">
+                  <span v-if="item.status === 'uploading'">上传中...</span>
+                  <span v-else-if="item.status === 'error'">上传失败</span>
+                  <span v-else>已就绪</span>
+                </div>
+              </div>
+              <button
+                type="button"
+                class="pending-upload-remove"
+                :disabled="loading || sessionSwitching"
+                @click="removePendingUpload(item.id)"
+              >
+                删除
+              </button>
+            </div>
+          </div>
+        </div>
 
-      <div class="copaw-input-footer">
+        <textarea
+          v-model="inputText"
+          class="copaw-textarea"
+          :disabled="sessionSwitching || uploadInFlight"
+          :maxlength="inputMaxLength"
+          placeholder="输入 / 查看快捷指令；可先上传文件再提问"
+          rows="3"
+          @keydown="onInputKeydown"
+          @compositionstart="onInputCompositionStart"
+          @compositionend="onInputCompositionEnd"
+        ></textarea>
+
+        <div class="copaw-input-footer">
         <div class="input-tools">
-          <button type="button" class="tool-icon-btn" :disabled="loading || sessionSwitching">
+          <button
+            type="button"
+            class="tool-icon-btn"
+            :disabled="loading || sessionSwitching || uploadInFlight"
+          >
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path
                 d="M12 4.5a2.5 2.5 0 0 1 2.5 2.5v5a2.5 2.5 0 0 1-5 0V7A2.5 2.5 0 0 1 12 4.5zM7.5 11.5a.75.75 0 0 1 .75.75 3.75 3.75 0 0 0 7.5 0 .75.75 0 0 1 1.5 0 5.25 5.25 0 0 1-4.5 5.2v1.3h2a.75.75 0 0 1 0 1.5h-5.5a.75.75 0 0 1 0-1.5h2v-1.3a5.25 5.25 0 0 1-4.5-5.2.75.75 0 0 1 .75-.75z"
               />
             </svg>
           </button>
-          <button type="button" class="tool-icon-btn" :disabled="loading || sessionSwitching">
+          <button
+            type="button"
+            class="tool-icon-btn"
+            :disabled="loading || sessionSwitching || uploadInFlight"
+            title="上传文件"
+            @click="openFilePicker"
+          >
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path
                 d="M8.5 12.5v5a3.5 3.5 0 0 0 7 0V9a2 2 0 0 0-4 0v7.5a.5.5 0 0 0 1 0V10a.75.75 0 0 1 1.5 0v6.5a2 2 0 0 1-4 0V9a3.5 3.5 0 0 1 7 0v8.5a5 5 0 0 1-10 0v-5a.75.75 0 0 1 1.5 0z"
               />
             </svg>
           </button>
+          <input
+            ref="fileInputRef"
+            type="file"
+            class="hidden-file-input"
+            :disabled="loading || sessionSwitching || uploadInFlight"
+            multiple
+            @change="onFileInputChange"
+          />
         </div>
 
-        <div class="input-actions">
-          <span class="input-counter">{{ inputText.length }}/{{ inputMaxLength }}</span>
+          <div class="input-actions">
+            <span class="input-counter">
+              {{ inputText.length }}/{{ inputMaxLength }}
+              <template v-if="uploadInFlight"> · 上传中...</template>
+            </span>
 
-          <button
-            v-if="!loading"
-            type="submit"
-            class="send-btn"
-            :disabled="sessionSwitching || !inputText.trim()"
-            aria-label="发送"
-          >
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M12 4.75a.75.75 0 0 1 .75.75v10.19l3.22-3.22a.75.75 0 1 1 1.06 1.06l-4.5 4.5a.75.75 0 0 1-1.06 0l-4.5-4.5a.75.75 0 1 1 1.06-1.06l3.22 3.22V5.5a.75.75 0 0 1 .75-.75z" />
-            </svg>
-          </button>
+            <button
+              v-if="!loading"
+              type="submit"
+              class="send-btn"
+              :disabled="sessionSwitching || uploadInFlight || !inputText.trim()"
+              aria-label="发送"
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 4.75a.75.75 0 0 1 .75.75v10.19l3.22-3.22a.75.75 0 1 1 1.06 1.06l-4.5 4.5a.75.75 0 0 1-1.06 0l-4.5-4.5a.75.75 0 1 1 1.06-1.06l3.22 3.22V5.5a.75.75 0 0 1 .75-.75z" />
+              </svg>
+            </button>
 
-          <button
-            v-else
-            type="button"
-            class="send-btn stop-btn"
-            :disabled="sessionSwitching"
-            aria-label="停止"
-            @click="onStopGeneration"
-          >
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M8 8h8v8H8z" />
-            </svg>
-          </button>
+            <button
+              v-else
+              type="button"
+              class="send-btn stop-btn"
+              :disabled="sessionSwitching"
+              aria-label="停止"
+              @click="onStopGeneration"
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M8 8h8v8H8z" />
+              </svg>
+            </button>
+          </div>
         </div>
       </div>
     </form>
@@ -194,7 +283,7 @@
 <script setup>
 import DOMPurify from "dompurify";
 import { marked } from "marked";
-import { nextTick, onMounted, ref } from "vue";
+import { nextTick, onMounted, onUnmounted, ref } from "vue";
 import {
   ensureSession,
   getAgentOptions,
@@ -205,6 +294,7 @@ import {
   selectSession,
   sendMessageStream,
   stopChatTask,
+  uploadChatFile,
 } from "../services/copawApi.js";
 
 const props = defineProps({
@@ -228,11 +318,14 @@ const props = defineProps({
 const emit = defineEmits(["skill-invoke", "skill-success", "skill-error"]);
 
 const bodyRef = ref(null);
+const fileInputRef = ref(null);
 const inputText = ref("");
 const inputMaxLength = 10000;
 const isInputComposing = ref(false);
 const loading = ref(false);
 const sessionSwitching = ref(false);
+const uploadInFlight = ref(false);
+const pendingUploads = ref([]);
 const sessionId = ref("");
 const messages = ref([]);
 const streamingStarted = ref(false);
@@ -316,11 +409,12 @@ function normalizeAgentValue(agentId) {
   return value;
 }
 
-function append(role, text) {
+function append(role, text, extra = {}) {
   const item = {
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     role,
     text,
+    ...extra,
   };
   messages.value.push(item);
   return item.id;
@@ -815,6 +909,171 @@ async function copyText(text) {
   }
 }
 
+function clearFileInputValue() {
+  if (!fileInputRef.value) return;
+  fileInputRef.value.value = "";
+}
+
+function makeUploadId() {
+  return `upload-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function makeStreamRequestId() {
+  return `stream-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function isImageMimeType(mimeType, fileName = "") {
+  const mt = String(mimeType || "").toLowerCase();
+  if (mt.startsWith("image/")) return true;
+  return /\.(png|jpe?g|gif|webp|svg)$/i.test(String(fileName || ""));
+}
+
+function isImageUpload(item) {
+  return isImageMimeType(item?.mimeType, item?.fileName);
+}
+
+function getUploadPreviewSrc(item) {
+  if (!item || typeof item !== "object") return "";
+  return String(item.url || item.localPreviewUrl || "").trim();
+}
+
+function revokeUploadPreview(item) {
+  const preview = String(item?.localPreviewUrl || "");
+  if (!preview.startsWith("blob:")) return;
+  try {
+    URL.revokeObjectURL(preview);
+  } catch {
+    // ignore
+  }
+}
+
+function openFilePicker() {
+  if (loading.value || sessionSwitching.value || uploadInFlight.value) return;
+  fileInputRef.value?.click();
+}
+
+function removePendingUpload(uploadId) {
+  const target = String(uploadId || "").trim();
+  const idx = pendingUploads.value.findIndex((item) => item.id === target);
+  if (idx === -1) return;
+  revokeUploadPreview(pendingUploads.value[idx]);
+  pendingUploads.value.splice(idx, 1);
+}
+
+function clearPendingUploads() {
+  for (const item of pendingUploads.value) {
+    revokeUploadPreview(item);
+  }
+  pendingUploads.value = [];
+}
+
+function updatePendingUpload(uploadId, patch = {}) {
+  const target = String(uploadId || "").trim();
+  if (!target) return;
+  const idx = pendingUploads.value.findIndex((item) => item.id === target);
+  if (idx === -1) return;
+  pendingUploads.value[idx] = {
+    ...pendingUploads.value[idx],
+    ...patch,
+  };
+}
+
+function uploadedFilesToMetadata(files) {
+  const source = Array.isArray(files) ? files : [];
+  return source
+    .map((item) => ({
+      fileName: String(item?.fileName || "").trim(),
+      relativePath: String(item?.relativePath || "").trim().replace(/\\/g, "/"),
+      absolutePath: String(item?.absolutePath || "").trim(),
+      url: String(item?.url || ""),
+      mimeType: String(item?.mimeType || ""),
+      size: Number(item?.size || 0),
+      status: String(item?.status || "").trim(),
+    }))
+    .filter((item) => item.relativePath && item.status !== "error");
+}
+
+async function onFileInputChange(event) {
+  const files = Array.from(event?.target?.files || []);
+  clearFileInputValue();
+  if (!files.length || loading.value || sessionSwitching.value || uploadInFlight.value) {
+    return;
+  }
+
+  uploadInFlight.value = true;
+  const successItems = [];
+  const errors = [];
+  const drafts = files.map((file) => ({
+    id: makeUploadId(),
+    fileName: file.name || "file",
+    relativePath: "",
+    absolutePath: "",
+    url: "",
+    mimeType: file.type || "",
+    size: Number(file.size || 0),
+    status: "uploading",
+    localPreviewUrl: isImageMimeType(file.type, file.name) ? URL.createObjectURL(file) : "",
+  }));
+  pendingUploads.value.push(...drafts);
+
+  try {
+    let targetSessionId = String(sessionId.value || "").trim();
+    if (!targetSessionId) {
+      targetSessionId = await ensureSession({
+        apiBaseUrl: props.apiBaseUrl,
+        tenantId: props.tenantId,
+        userId: props.userId,
+        channel: props.channel,
+      });
+      sessionId.value = targetSessionId;
+    }
+
+    for (let i = 0; i < files.length; i += 1) {
+      const file = files[i];
+      const draft = drafts[i];
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        const uploaded = await uploadChatFile({
+          apiBaseUrl: props.apiBaseUrl,
+          tenantId: props.tenantId,
+          userId: props.userId,
+          channel: props.channel,
+          sessionId: targetSessionId,
+          file,
+        });
+        const relativePath = String(uploaded.relativePath || "").trim().replace(/\\/g, "/");
+        if (!relativePath) {
+          throw new Error("server did not return relativePath");
+        }
+        updatePendingUpload(draft.id, {
+          fileName: uploaded.fileName || file.name,
+          relativePath,
+          absolutePath: uploaded.absolutePath || "",
+          url: uploaded.url ? `${props.apiBaseUrl}${uploaded.url}` : "",
+          mimeType: uploaded.mimeType || file.type,
+          size: uploaded.size || file.size,
+          status: "ready",
+        });
+        successItems.push(relativePath);
+      } catch (error) {
+        updatePendingUpload(draft.id, {
+          status: "error",
+        });
+        errors.push(`${file.name}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  } finally {
+    uploadInFlight.value = false;
+  }
+
+  if (errors.length) {
+    append("assistant", `以下文件上传失败：\n${errors.map((item) => `- ${item}`).join("\n")}`);
+  }
+  if (errors.length || successItems.length) {
+    await scrollToBottom();
+  }
+}
+
 function isAbortError(error) {
   if (!error || typeof error !== "object") return false;
   const name = String(error.name || "");
@@ -836,7 +1095,7 @@ function onInputKeydown(event) {
   if (!event || event.key !== "Enter") return;
   if (event.shiftKey || isInputComposing.value) return;
   event.preventDefault();
-  if (loading.value) return;
+  if (loading.value || uploadInFlight.value) return;
   void onSubmit();
 }
 
@@ -998,6 +1257,57 @@ async function loadHistory(targetSessionId = "") {
   selectedTraceId.value = "";
 }
 
+function normalizeComparableText(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+async function recoverHistoryAfterStreamFailure(expectedUserText, targetSessionId = "") {
+  const sid = String(targetSessionId || sessionId.value || "").trim();
+  const expected = normalizeComparableText(expectedUserText);
+  if (!sid || !expected) {
+    return { recovered: false, userTracked: false };
+  }
+
+  try {
+    const data = await getHistory({
+      apiBaseUrl: props.apiBaseUrl,
+      tenantId: props.tenantId,
+      userId: props.userId,
+      channel: props.channel,
+      sessionId: sid,
+      limit: 100,
+    });
+    const mapped = mapHistoryItems(data.items || []);
+    if (!mapped.length) {
+      return { recovered: false, userTracked: false };
+    }
+
+    let userIdx = -1;
+    for (let i = mapped.length - 1; i >= 0; i -= 1) {
+      const item = mapped[i];
+      if (item?.role !== "user") continue;
+      if (normalizeComparableText(item.text) === expected) {
+        userIdx = i;
+        break;
+      }
+    }
+    if (userIdx === -1) {
+      return { recovered: false, userTracked: false };
+    }
+
+    const hasAssistantAfter = mapped
+      .slice(userIdx + 1)
+      .some((item) => item?.role === "assistant" && String(item.text || "").trim());
+
+    messages.value = mapped;
+    sessionId.value = String(data.sessionId || sid || sessionId.value);
+    selectedTraceId.value = "";
+    return { recovered: hasAssistantAfter, userTracked: true };
+  } catch {
+    return { recovered: false, userTracked: false };
+  }
+}
+
 function onModelChange() {
   writeStoredModelId(selectedModelId.value);
 }
@@ -1050,10 +1360,10 @@ async function onPickHistory(item) {
   }
 }
 
-async function runChat(text) {
+async function runChat(text, extraMetadata = {}, userMessageExtra = {}) {
   if (!text || loading.value || sessionSwitching.value) return;
 
-  append("user", text);
+  append("user", text, userMessageExtra);
   loading.value = true;
   streamingStarted.value = false;
   stopRequested.value = false;
@@ -1069,6 +1379,7 @@ async function runChat(text) {
     const toolByMsgId = new Map();
     const toolByCallId = new Map();
     const effectiveAgentId = normalizeAgentValue(selectedAgentId.value);
+    const streamRequestId = makeStreamRequestId();
     activeStreamAgentId.value = effectiveAgentId;
     executedSkillCommandIds.clear();
 
@@ -1081,12 +1392,17 @@ async function runChat(text) {
       agentId: effectiveAgentId,
       modelId: selectedModelId.value,
       message: text,
+      requestId: streamRequestId,
       signal: abortController.signal,
       metadata: {
         source: "embedded-vue-widget",
         model_id: selectedModelId.value || "",
         agent_id: effectiveAgentId,
+        ...(extraMetadata && typeof extraMetadata === "object" ? extraMetadata : {}),
       },
+      maxReconnectAttempts: 2,
+      reconnectBaseDelayMs: 600,
+      reconnectMaxDelayMs: 4000,
       onEvent: (ev) => {
         if (!ev || typeof ev !== "object") return;
 
@@ -1261,7 +1577,14 @@ async function runChat(text) {
     if (stopRequested.value || isAbortError(error)) {
       append("assistant", "已停止本次生成。");
     } else {
-      append("assistant", `请求失败：${error.message}`);
+      const recovered = await recoverHistoryAfterStreamFailure(text, sessionId.value);
+      if (!recovered.recovered) {
+        if (recovered.userTracked) {
+          append("assistant", "网络中断，本轮问题已记录，但回答未完成，请重试。");
+        } else {
+          append("assistant", `请求失败：${error.message}`);
+        }
+      }
     }
   } finally {
     streamAbortController.value = null;
@@ -1275,10 +1598,32 @@ async function runChat(text) {
 }
 
 async function onSubmit() {
+  if (uploadInFlight.value || sessionSwitching.value) return;
   const text = inputText.value.trim();
   if (!text) return;
+  const uploadedFiles = uploadedFilesToMetadata(pendingUploads.value);
+  const submittedAttachments = uploadedFiles.map((item) => ({
+    fileName: item.fileName || item.relativePath.split("/").pop() || "file",
+    relativePath: item.relativePath,
+    url: item.url || "",
+    mimeType: item.mimeType || "",
+    size: item.size || 0,
+  }));
   inputText.value = "";
-  await runChat(text);
+  clearPendingUploads();
+  await runChat(
+    text,
+    uploadedFiles.length
+      ? {
+          uploadedFiles,
+        }
+      : {},
+    uploadedFiles.length
+      ? {
+          attachments: submittedAttachments,
+        }
+      : {}
+  );
 }
 
 async function onRerun() {
@@ -1299,6 +1644,8 @@ async function onNewChat() {
     });
     messages.value = [];
     selectedTraceId.value = "";
+    clearPendingUploads();
+    clearFileInputValue();
     append("assistant", "已新建聊天，我们重新开始。");
     if (showHistoryPanel.value) {
       await refreshChatSessions();
@@ -1323,6 +1670,11 @@ onMounted(async () => {
     append("assistant", `初始化失败：${error.message}`);
   }
   await scrollToBottom();
+});
+
+onUnmounted(() => {
+  clearPendingUploads();
+  clearFileInputValue();
 });
 </script>
 
@@ -1508,6 +1860,62 @@ onMounted(async () => {
 .msg.user .bubble {
   background: #0f62fe;
   color: #fff;
+}
+
+.msg.user .user-upload-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.msg.user .user-upload-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 220px;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  border-radius: 8px;
+  padding: 4px 6px;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.msg.user .user-upload-thumb {
+  width: 34px;
+  height: 34px;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  background: rgba(255, 255, 255, 0.22);
+}
+
+.msg.user .user-upload-type {
+  width: 34px;
+  height: 34px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 700;
+  color: rgba(255, 255, 255, 0.95);
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.msg.user .user-upload-name {
+  min-width: 0;
+  max-width: 150px;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.95);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.msg.user .user-text {
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .msg.assistant .bubble {
@@ -1802,9 +2210,9 @@ onMounted(async () => {
   width: 100%;
   min-height: 60px;
   max-height: 200px;
-  border: 1px solid #d8dde6;
-  border-radius: 10px;
-  padding: 12px 14px 8px;
+  border: none;
+  border-radius: 0;
+  padding: 8px 14px 8px;
   resize: vertical;
   font-size: 14px;
   line-height: 1.45;
@@ -1818,8 +2226,105 @@ onMounted(async () => {
 
 .copaw-textarea:focus {
   outline: none;
-  border-color: #c5ccd8;
-  box-shadow: 0 0 0 2px rgba(15, 98, 254, 0.08);
+  box-shadow: none;
+}
+
+.composer-shell {
+  border: 1px solid #d8dde6;
+  border-radius: 10px;
+  background: #fff;
+  overflow: hidden;
+}
+
+.composer-shell.has-attachments {
+  border-color: #f97316;
+}
+
+.composer-attachments {
+  border-bottom: 1px solid #eef2f7;
+  padding: 8px 10px 6px;
+  background: #fff;
+}
+
+.composer-attachments-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: #334155;
+}
+
+.composer-attachments-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.composer-attachment-item {
+  display: flex;
+  align-items: center;
+  min-width: 120px;
+  max-width: 220px;
+  gap: 8px;
+  border: 1px solid #dce6f6;
+  border-radius: 8px;
+  padding: 4px 6px;
+  background: #fff;
+}
+
+.composer-attachment-thumb {
+  width: 48px;
+  height: 48px;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid #dbe4f3;
+  background: #f8fafc;
+}
+
+.composer-attachment-file {
+  width: 48px;
+  height: 48px;
+  border-radius: 6px;
+  border: 1px solid #dbe4f3;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 700;
+  color: #475569;
+  background: #f8fafc;
+}
+
+.composer-attachment-meta {
+  min-width: 0;
+  flex: 1;
+}
+
+.composer-attachment-name {
+  font-size: 12px;
+  color: #334155;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-attachment-status {
+  margin-top: 2px;
+  font-size: 11px;
+  color: #64748b;
+}
+
+.pending-upload-remove,
+.clear-upload-btn {
+  border: 1px solid #d1d9e6;
+  background: #fff;
+  color: #475569;
+  border-radius: 6px;
+  padding: 2px 6px;
+  font-size: 12px;
+  cursor: pointer;
 }
 
 .copaw-input-footer {
@@ -1827,14 +2332,17 @@ onMounted(async () => {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-top: -1px;
-  padding: 8px 10px 0;
+  padding: 8px 10px;
 }
 
 .input-tools {
   display: flex;
   align-items: center;
   gap: 4px;
+}
+
+.hidden-file-input {
+  display: none;
 }
 
 .ghost {

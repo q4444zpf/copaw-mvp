@@ -132,23 +132,83 @@ export function parseCopawResponse(raw) {
 }
 
 function buildPayload({ tenantId, userId, channel, sessionId, message, metadata }) {
+  const normalizedMessage = buildMessageWithUploads(message, metadata);
+  const normalizedMetadata = normalizeMetadata(metadata);
   const mode = process.env.COPAW_API_MODE || "agent_process";
   if (mode === "channel_webhook") {
     return {
       channel,
       user_id: `${tenantId}:${userId}`,
       session_id: sessionId,
-      message,
-      metadata,
+      message: normalizedMessage,
+      metadata: normalizedMetadata,
     };
   }
 
   return {
     channel,
     user_id: `${tenantId}:${userId}`,
-    input: [{ role: "user", content: [{ type: "text", text: message }] }],
+    input: [{ role: "user", content: [{ type: "text", text: normalizedMessage }] }],
     session_id: sessionId,
   };
+}
+
+function normalizeMetadata(metadata) {
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+    return {};
+  }
+  return metadata;
+}
+
+function normalizeRelativePath(rawPath) {
+  const normalized = String(rawPath || "")
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\/+/, "");
+  if (!normalized || normalized.split("/").includes("..")) return "";
+  return normalized;
+}
+
+function normalizeUploadedFiles(metadata) {
+  const meta = normalizeMetadata(metadata);
+  const source = Array.isArray(meta.uploadedFiles) ? meta.uploadedFiles : [];
+  const files = [];
+  const seen = new Set();
+
+  for (const item of source) {
+    if (!item || typeof item !== "object") continue;
+    const relativePath = normalizeRelativePath(item.relativePath || item.path || item.workspacePath);
+    const absolutePath = String(item.absolutePath || item.absPath || "").trim();
+    const fileName = String(item.fileName || item.name || "").trim();
+    const key = `${relativePath}|${absolutePath}|${fileName}`.toLowerCase();
+    if (!relativePath && !absolutePath && !fileName) continue;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    files.push({ relativePath, absolutePath, fileName });
+  }
+  return files;
+}
+
+function buildMessageWithUploads(message, metadata) {
+  const text = String(message || "").trim();
+  const uploadedFiles = normalizeUploadedFiles(metadata);
+  if (!uploadedFiles.length) return text;
+
+  const lines = uploadedFiles.map((item) => {
+    const displayPath = item.absolutePath || item.relativePath || item.fileName || "";
+    if (item.absolutePath && item.relativePath) {
+      return `- ${item.absolutePath} (relative: ${item.relativePath})`;
+    }
+    return `- ${displayPath}`;
+  });
+  const attachmentHint = [
+    "",
+    "[用户已上传到工作目录的文件]",
+    ...lines,
+    "请优先基于这些文件内容回答用户问题；若需要请先读取文件后再回答。",
+  ].join("\n");
+
+  return `${text}\n${attachmentHint}`.trim();
 }
 
 function buildRawSummary(res, rawText) {

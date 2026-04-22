@@ -102,6 +102,37 @@ export async function resetSession({ apiBaseUrl, tenantId, userId, channel }) {
   return data.sessionId;
 }
 
+export async function uploadChatFile({
+  apiBaseUrl,
+  tenantId,
+  userId,
+  channel,
+  sessionId = "",
+  file,
+}) {
+  const formData = new FormData();
+  formData.append("file", file);
+  formData.append("channel", channel || "web-chat");
+  if (sessionId) {
+    formData.append("sessionId", String(sessionId));
+  }
+
+  const res = await fetch(`${apiBaseUrl}/api/chat/upload`, {
+    method: "POST",
+    headers: {
+      "x-tenant-id": tenantId,
+      "x-user-id": userId,
+    },
+    body: formData,
+  });
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error || "Failed to upload file");
+  }
+  return data;
+}
+
 export async function getHistory({
   apiBaseUrl,
   tenantId,
@@ -212,6 +243,51 @@ function splitSseFrames(buffer) {
   return { frames, rest };
 }
 
+function isAbortLikeError(error) {
+  if (!error || typeof error !== "object") return false;
+  const name = String(error.name || "");
+  const message = String(error.message || "").toLowerCase();
+  return name === "AbortError" || message.includes("aborted");
+}
+
+function isRetryableStreamError(error) {
+  const status = Number(error?.status || 0);
+  if (status === 408 || status === 425 || status === 429) return true;
+  if (status >= 500 && status < 600) return true;
+
+  const name = String(error?.name || "");
+  const message = String(error?.message || "").toLowerCase();
+  if (name === "TypeError") return true;
+  if (message.includes("failed to fetch")) return true;
+  if (message.includes("network")) return true;
+  if (message.includes("stream")) return true;
+  return false;
+}
+
+function delayWithSignal(ms, signal) {
+  const waitMs = Math.max(0, Number(ms || 0));
+  if (!signal) {
+    return new Promise((resolve) => {
+      setTimeout(resolve, waitMs);
+    });
+  }
+  if (signal.aborted) {
+    throw new DOMException("Aborted", "AbortError");
+  }
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, waitMs);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 export async function sendMessageStream({
   apiBaseUrl,
   tenantId,
@@ -221,71 +297,119 @@ export async function sendMessageStream({
   agentId = "",
   modelId = "",
   message,
+  requestId = "",
   metadata = {},
+  maxReconnectAttempts = 2,
+  reconnectBaseDelayMs = 600,
+  reconnectMaxDelayMs = 4000,
   signal,
   onEvent = () => {},
+  onReconnect = () => {},
 }) {
-  const res = await fetch(`${apiBaseUrl}/api/chat/stream`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-tenant-id": tenantId,
-      "x-user-id": userId,
-      Accept: "text/event-stream",
-    },
-    signal,
-    body: JSON.stringify({ channel, sessionId, agentId, modelId, message, metadata }),
-  });
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(text || "Failed to stream message");
-  }
-  if (!res.body) {
-    throw new Error("No response stream available");
+  const reconnectLimit = Math.max(0, Math.floor(Number(maxReconnectAttempts || 0)));
+  const baseDelay = Math.max(100, Number(reconnectBaseDelayMs || 600));
+  const maxDelay = Math.max(baseDelay, Number(reconnectMaxDelayMs || 4000));
+  const streamRequestId = String(requestId || "").trim();
+  const payload = { channel, sessionId, agentId, modelId, message, metadata };
+  if (streamRequestId) {
+    payload.requestId = streamRequestId;
   }
 
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder("utf-8");
-  let buffer = "";
-  let doneEvent = null;
+  let attempt = 0;
+  let sawBusinessEvent = false;
 
   while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+    try {
+      const res = await fetch(`${apiBaseUrl}/api/chat/stream`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-tenant-id": tenantId,
+          "x-user-id": userId,
+          Accept: "text/event-stream",
+        },
+        signal,
+        body: JSON.stringify(payload),
+      });
 
-    const split = splitSseFrames(buffer);
-    buffer = split.rest;
-    for (const frame of split.frames) {
-      const ev = parseSseFrame(frame);
-      if (!ev) continue;
-      if (ev.type === "error") {
-        throw new Error(ev.error || "stream error");
+      if (!res.ok) {
+        const text = await res.text();
+        const err = new Error(text || `Failed to stream message (${res.status})`);
+        err.status = res.status;
+        throw err;
       }
-      if (ev.type === "done") {
-        doneEvent = ev;
+      if (!res.body) {
+        throw new Error("No response stream available");
       }
-      onEvent(ev);
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let buffer = "";
+      let doneEvent = null;
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        const split = splitSseFrames(buffer);
+        buffer = split.rest;
+        for (const frame of split.frames) {
+          const ev = parseSseFrame(frame);
+          if (!ev) continue;
+          if (ev.type === "error") {
+            throw new Error(ev.error || "stream error");
+          }
+          if (ev.type === "done") {
+            doneEvent = ev;
+          }
+          if (ev.type !== "ping") {
+            sawBusinessEvent = true;
+            onEvent(ev);
+          }
+        }
+      }
+
+      const tail = decoder.decode();
+      if (tail) {
+        buffer += tail;
+      }
+      if (buffer.trim()) {
+        const ev = parseSseFrame(buffer);
+        if (ev) {
+          if (ev.type === "error") {
+            throw new Error(ev.error || "stream error");
+          }
+          if (ev.type === "done") {
+            doneEvent = ev;
+          }
+          if (ev.type !== "ping") {
+            sawBusinessEvent = true;
+            onEvent(ev);
+          }
+        }
+      }
+
+      return doneEvent;
+    } catch (error) {
+      if (isAbortLikeError(error) || signal?.aborted) {
+        throw error;
+      }
+
+      const canRetry =
+        !sawBusinessEvent && attempt < reconnectLimit && isRetryableStreamError(error);
+      if (!canRetry) {
+        throw error;
+      }
+
+      attempt += 1;
+      const delayMs = Math.min(maxDelay, baseDelay * 2 ** (attempt - 1));
+      try {
+        onReconnect({ attempt, delayMs, error });
+      } catch {
+        // ignore callback errors
+      }
+      await delayWithSignal(delayMs, signal);
     }
   }
-
-  const tail = decoder.decode();
-  if (tail) {
-    buffer += tail;
-  }
-  if (buffer.trim()) {
-    const ev = parseSseFrame(buffer);
-    if (ev) {
-      if (ev.type === "error") {
-        throw new Error(ev.error || "stream error");
-      }
-      if (ev.type === "done") {
-        doneEvent = ev;
-      }
-      onEvent(ev);
-    }
-  }
-
-  return doneEvent;
 }
